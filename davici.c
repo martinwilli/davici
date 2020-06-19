@@ -18,15 +18,24 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <string.h>
+#include <fcntl.h>
+#include <limits.h>
+#ifdef _WIN32
+#include <WinSock2.h>
+#define sockerr WSAGetLastError()
+#define is_recoverable(err) (err == WSAEWOULDBLOCK || err == WSAEINTR)
+#else
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <fcntl.h>
-#include <limits.h>
+#define closesocket close
+#define sockerr errno
+#define is_recoverable(err) (err == EWOULDBLOCK || err == EINTR)
+#endif
 
 /* buffer size for a name tag */
 #define NAME_BUF_LEN (UCHAR_MAX + 1)
@@ -77,7 +86,7 @@ struct davici_event {
 };
 
 struct davici_conn {
-	int s;
+	davici_fd s;
 	struct davici_request *reqs;
 	struct davici_event *events;
 	struct davici_packet pkt;
@@ -85,6 +94,66 @@ struct davici_conn {
 	void *user;
 	enum davici_fdops ops;
 };
+
+#ifdef _WIN32
+
+static int connect_and_ioctl(SOCKET s, int port)
+{
+	struct sockaddr_in addr;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons( port );
+	addr.sin_addr.s_addr = 0x0100007F;
+
+	if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) != 0)
+	{
+		return -sockerr;
+	}
+
+	u_long flags = 1;
+	if (ioctlsocket( s, FIONBIO, &flags ) == SOCKET_ERROR)
+	{
+		return -sockerr;
+	}
+
+	return 0;
+}
+
+int davici_connect_tcp(int port, davici_fdcb fdcb, void *user,
+					   struct davici_conn **cp)
+{
+	struct davici_conn *c;
+	int err;
+
+	c = calloc(1, sizeof(*c));
+	if (!c)
+	{
+		return -errno;
+	}
+	c->fdcb = fdcb;
+	c->user = user;
+
+	c->s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (c->s < 0)
+	{
+		err = -sockerr;
+		free(c);
+		return err;
+	}
+	err = connect_and_ioctl(c->s, port);
+	if (err < 0)
+	{
+		closesocket(c->s);
+		free(c);
+		return err;
+	}
+
+	*cp = c;
+	return 0;
+}
+
+#else
 
 static int connect_and_fcntl(int fd, const char *path)
 {
@@ -98,19 +167,19 @@ static int connect_and_fcntl(int fd, const char *path)
 
 	if (connect(fd, (struct sockaddr*)&addr, len) != 0)
 	{
-		return -errno;
+		return -sockerr;
 	}
 	flags = fcntl(fd, F_GETFL);
 	if (flags == -1)
 	{
-		return -errno;
+		return -sockerr;
 	}
 #ifdef O_CLOEXEC
 	flags |= O_CLOEXEC;
 #endif
 	if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1)
 	{
-		return -errno;
+		return -sockerr;
 	}
 	return 0;
 }
@@ -132,7 +201,7 @@ int davici_connect_unix(const char *path, davici_fdcb fdcb, void *user,
 	c->s = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (c->s < 0)
 	{
-		err = -errno;
+		err = -sockerr;
 		free(c);
 		return err;
 	}
@@ -153,6 +222,8 @@ static unsigned int max(unsigned int a, unsigned int b)
 	return a > b ? a : b;
 }
 
+#endif
+
 static int update_ops(struct davici_conn *c, enum davici_fdops ops)
 {
 	int ret;
@@ -172,7 +243,7 @@ static int update_ops(struct davici_conn *c, enum davici_fdops ops)
 static int copy_name(char *out, unsigned int outlen,
 					 const char *in, unsigned int inlen)
 {
-	int i;
+	unsigned int i;
 
 	if (inlen >= outlen)
 	{
@@ -198,7 +269,7 @@ static struct davici_request* pop_request(struct davici_conn *c,
 
 	req = c->reqs;
 	if (!req || !req->cb || req->used < 2 ||
-		req->buf[0] != type || req->used - 2 < req->buf[1])
+		req->buf[0] != type || req->used - 2 < (unsigned int)req->buf[1])
 	{
 		return NULL;
 	}
@@ -301,7 +372,7 @@ static int add_event(struct davici_conn *c, const char *name,
 					 davici_cb cb, void *user)
 {
 	struct davici_event *ev;
-	int len;
+	size_t len;
 
 	len = strlen(name);
 	ev = calloc(sizeof(*ev) + len + 1, 1);
@@ -358,7 +429,7 @@ static int handle_event(struct davici_conn *c, struct davici_packet *pkt)
 	char name[NAME_BUF_LEN];
 	int err;
 
-	if (!pkt->received || pkt->buf[0] >= c->pkt.received - 1)
+	if (!pkt->received || (unsigned int)pkt->buf[0] >= c->pkt.received - 1)
 	{
 		return -EBADMSG;
 	}
@@ -414,11 +485,11 @@ int davici_read(struct davici_conn *c)
 				   sizeof(c->pkt.len) - c->pkt.received, 0);
 		if (len == -1)
 		{
-			if (errno == EWOULDBLOCK || errno == EINTR)
+			if (is_recoverable(sockerr))
 			{
 				return 0;
 			}
-			return -errno;
+			return -sockerr;
 		}
 		if (len == 0)
 		{
@@ -442,11 +513,11 @@ int davici_read(struct davici_conn *c)
 				   size - (c->pkt.received - sizeof(c->pkt.len)), 0);
 		if (len == -1)
 		{
-			if (errno == EWOULDBLOCK || errno == EINTR)
+			if (is_recoverable(sockerr))
 			{
 				return 0;
 			}
-			return -errno;
+			return -sockerr;
 		}
 		if (len == 0)
 		{
@@ -484,11 +555,11 @@ int davici_write(struct davici_conn *c)
 					   sizeof(size) - req->sent, 0);
 			if (len == -1)
 			{
-				if (errno == EWOULDBLOCK || errno == EINTR)
+				if (is_recoverable(sockerr))
 				{
 					return 0;
 				}
-				return -errno;
+				return -sockerr;
 			}
 			req->sent += len;
 		}
@@ -498,11 +569,11 @@ int davici_write(struct davici_conn *c)
 					   req->used - (req->sent - sizeof(size)), 0);
 			if (len == -1)
 			{
-				if (errno == EWOULDBLOCK || errno == EINTR)
+				if (is_recoverable(sockerr))
 				{
 					return 0;
 				}
-				return -errno;
+				return -sockerr;
 			}
 			req->sent += len;
 		}
@@ -539,8 +610,13 @@ void davici_disconnect(struct davici_conn *c)
 		free(req);
 		req = next;
 	}
-	close(c->s);
+	closesocket(c->s);
 	free(c);
+}
+
+unsigned int davici_get_ops(struct davici_conn *c)
+{
+	return c->ops;
 }
 
 static int create_request(enum davici_packet_type type, const char *name,
@@ -557,7 +633,7 @@ static int create_request(enum davici_packet_type type, const char *name,
 	req->used = 2;
 	if (name)
 	{
-		req->used += strlen(name);
+		req->used += (unsigned int)strlen(name);
 	}
 	req->allocated = max(32, req->used);
 	req->buf = malloc(req->allocated);
@@ -615,7 +691,7 @@ void davici_section_start(struct davici_request *r, const char *name)
 	uint8_t nlen;
 	char *pos;
 
-	nlen = strlen(name);
+	nlen = (uint8_t)strlen(name);
 	pos = add_element(r, DAVICI_SECTION_START, 1 + nlen);
 	if (pos)
 	{
@@ -636,7 +712,7 @@ void davici_kv(struct davici_request *r, const char *name,
 	uint16_t vlen;
 	char *pos;
 
-	nlen = strlen(name);
+	nlen = (uint8_t)strlen(name);
 	pos = add_element(r, DAVICI_KEY_VALUE, 1 + nlen + sizeof(vlen) + buflen);
 	if (pos)
 	{
@@ -699,7 +775,7 @@ void davici_list_start(struct davici_request *r, const char *name)
 	uint8_t nlen;
 	char *pos;
 
-	nlen = strlen(name);
+	nlen = (uint8_t)strlen(name);
 	pos = add_element(r, DAVICI_LIST_START, 1 + nlen);
 	if (pos)
 	{
@@ -1153,7 +1229,8 @@ int davici_get_value_str(struct davici_response *res,
 						 char *buf, unsigned int buflen)
 {
 	const char *val = res->buf;
-	int i, len;
+	unsigned int i;
+	int len;
 
 	for (i = 0; i < res->buflen; i++)
 	{
@@ -1167,7 +1244,7 @@ int davici_get_value_str(struct davici_response *res,
 	{
 		return -errno;
 	}
-	if (len >= buflen)
+	if ((unsigned int)len >= buflen)
 	{
 		return -ENOBUFS;
 	}
@@ -1193,7 +1270,7 @@ int davici_value_strcmp(struct davici_response *res, const char *str)
 int davici_dump(struct davici_response *res, const char *name, const char *sep,
 				unsigned int level, unsigned int indent, FILE *out)
 {
-	ssize_t len, total = 0;
+	int len, total = 0;
 	char buf[4096];
 	int err;
 
@@ -1261,4 +1338,54 @@ int davici_dump(struct davici_response *res, const char *name, const char *sep,
 		}
 		total += len;
 	}
+}
+
+
+int davici_select(struct davici_conn *c, int *rready, int *wready, struct timeval *timeout)
+{
+    fd_set rfds, wfds;
+    int err;
+
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_SET(c->s, &rfds);
+    FD_SET(c->s, &wfds);
+
+    if (rready && wready)
+    {
+        err = select((int)c->s + 1, &rfds, &wfds, NULL, timeout);
+    }
+    else if (rready && !wready)
+    {
+        err = select((int)c->s + 1, &rfds, NULL, NULL, timeout);
+    }
+    else if (!rready && wready)
+    {
+        err = select((int)c->s + 1, NULL, &wfds, NULL, timeout);
+    }
+    else
+    {
+        return -EINVAL;
+    }
+
+    if (err == 0)
+    {
+        return 1;
+    }
+    else if (err == -1)
+    {
+        return -sockerr;
+    }
+    else
+    {
+        if (rready)
+        {
+            *rready = FD_ISSET(c->s, &rfds) ? 1 : 0;
+        }
+        if (wready)
+        {
+            *wready = FD_ISSET(c->s, &wfds) ? 1 : 0;
+        }
+        return 0;
+    }
 }

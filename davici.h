@@ -25,6 +25,13 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#if defined( _WIN32 )
+#define davici_fd size_t
+#else
+#include <sys/time.h>
+#define davici_fd int
+#endif /* _WIN32 */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -117,7 +124,7 @@ typedef void (*davici_cb)(struct davici_conn *conn, int err, const char *name,
  * @param user		user context passed during connection
  * @return			0 if watch updated, or a negative errno
  */
-typedef int (*davici_fdcb)(struct davici_conn *conn, int fd, int ops,
+typedef int (*davici_fdcb)(struct davici_conn *conn, davici_fd fd, int ops,
 						   void *user);
 
 /**
@@ -136,6 +143,28 @@ typedef int (*davici_fdcb)(struct davici_conn *conn, int fd, int ops,
  */
 typedef int (*davici_recursecb)(struct davici_response *res, void *user);
 
+#ifdef _WIN32
+
+/**
+ * Create a connection to a VICI TCP socket.
+ *
+ * Opens a TCP socket connection to a VICI service on the given port, using a
+ * file descriptor monitoring callback function as discussed above.
+ *
+ * Please note that this function uses connect() on a blocking socket, which
+ * in theory is a blocking call.
+ *
+ * @param port		port on local host to connect socket
+ * @param fdcb		callback to register for file descriptor watching
+ * @param user		user context to pass to fdcb
+ * @param connp		pointer receiving connection context on success
+ * @return			0 on success, or a negative errno
+ */
+int davici_connect_tcp(int port, davici_fdcb fdcb, void *user,
+					   struct davici_conn **connp);
+
+#else
+
 /**
  * Create a connection to a VICI Unix socket.
  *
@@ -153,6 +182,8 @@ typedef int (*davici_recursecb)(struct davici_response *res, void *user);
  */
 int davici_connect_unix(const char *path, davici_fdcb fdcb, void *user,
 						struct davici_conn **connp);
+
+#endif
 
 /**
  * Read and process pending connection data.
@@ -197,6 +228,17 @@ int davici_write(struct davici_conn *conn);
  * @param conn		opaque connection context
  */
 void davici_disconnect(struct davici_conn *conn);
+
+/**
+ * Get the current pending operations of a connection.
+ *
+ * The connection ops is a bitwise OR of DAVICI_READ and/or DAVICI_WRITE. It
+ * indicates which of these operations are pending (waiting to be sent).
+ *
+ * @param conn		opaque connection context
+ * @return			pending operations
+ */
+unsigned int davici_get_ops(struct davici_conn *conn);
 
 /**
  * Allocate a new request command message.
@@ -613,6 +655,24 @@ int davici_value_strcmp(struct davici_response *res, const char *str);
  */
 int davici_dump(struct davici_response *res, const char *name, const char *sep,
 				unsigned int level, unsigned int indent, FILE *out);
+
+/**
+ * Perform a select operation on the davici socket.
+ *
+ * Waits on the internal socket until the socket is ready to be read, written,
+ * or until the specified timeout occurs.
+ *
+ * If the timeout value is NULL, the function will wait indefinitely. If it is
+ * specified but tv_sec and tv_usec are both 0, it will return immediately.
+ *
+ * @param conn        opaque connection context
+ * @param rready    pointer receiving 1 if the socket is ready to be read, 0 if not
+ * @param wready    pointer receiving 1 if the socket is ready to be written, 0 if not
+ * @param timeout    timeout value
+ * @return            0 on success, 1 on timeout, or a negative errno
+ */
+int davici_select(struct davici_conn *conn, int *rready, int *wready,
+                  struct timeval *timeout);
 
 #ifdef __cplusplus
 }
